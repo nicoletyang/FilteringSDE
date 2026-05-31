@@ -12,7 +12,7 @@ pip install -r requirements.txt
 ```
 
 
-# Usage
+## Usage
 
 Stochastic Lorenz 96 experiment
 
