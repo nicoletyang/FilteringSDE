@@ -1,8 +1,7 @@
-# AmortizedSDEs
-Pathwise learning of SDEs under noisy observation. Code accompanying the paper 
-Yang, Nicole Tianjiao. "Pathwise Learning of Stochastic Dynamical Systems with Partial Observations." arXiv preprint arXiv:2601.21860 (2026). 
+# FilteringSDEs
+Neural path filtering of stochastic dynamical systems under partial observations. Code accompanying the paper [1]
 
-We explore robust and accurate surrogate modeling of stochastic dynamical systems with noisy and partial observations, with the capability of uncertainty quantification and online inference for both filtering marginals and trajectory-dependent functionals. The method is a conditional generative model that gives posterior distribution of the system amortized over observation paths. The code is modified based on Latent SDEs.
+We explore robust and accurate surrogate modeling of stochastic dynamical systems with noisy and partial observations, with the capability of uncertainty quantification and online inference for both filtering marginals and trajectory-dependent functionals. The method is a conditional generative model that gives posterior distribution of the system amortized over observation paths. The code is modified based on Latent SDEs [2].
 
 Experiments on Lorenz-96 and MuJoCo.
 
@@ -52,3 +51,8 @@ The SDE class must expose:
 - `h(t, y, obs)` — prior drift (only needed when `logqp=True`)
 - `g(t, y)` — diagonal diffusion (no obs needed)
 - `noise_type = "diagonal"`, `sde_type = "ito"`
+
+# References
+
+[1] Yang, Nicole Tianjiao. "Pathwise Learning of Stochastic Dynamical Systems with Partial Observations." arXiv preprint arXiv:2601.21860 (2026). 
+[2] Li, Xuechen, Ting-Kam Leonard Wong, Ricky TQ Chen, and David Duvenaud. "Scalable gradients for stochastic differential equations." In International conference on artificial intelligence and statistics, pp. 3870-3882. PMLR, 2020.
