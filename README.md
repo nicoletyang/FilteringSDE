@@ -55,4 +55,5 @@ The SDE class must expose:
 # References
 
 [1] Yang, Nicole Tianjiao. "Pathwise Learning of Stochastic Dynamical Systems with Partial Observations." arXiv preprint arXiv:2601.21860 (2026). 
+
 [2] Li, Xuechen, Ting-Kam Leonard Wong, Ricky TQ Chen, and David Duvenaud. "Scalable gradients for stochastic differential equations." In International conference on artificial intelligence and statistics, pp. 3870-3882. PMLR, 2020.
