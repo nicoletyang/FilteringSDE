@@ -1,0 +1,8 @@
+torch>=2.0
+torchsde==0.2.6
+fire>=0.5
+tqdm>=4.60
+scipy>=1.9
+matplotlib>=3.5
+numpy>=1.23
+scikit-learn>=1.0
