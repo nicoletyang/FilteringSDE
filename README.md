@@ -4,7 +4,7 @@ Neural path filtering of stochastic dynamical systems under partial observations
 
 > Yang, Nicole Tianjiao. "Pathwise Learning of Stochastic Dynamical Systems with Partial Observations." arXiv:2601.21860 (2026).
 
-We learn a conditional generative model that produces posterior distributions over latent trajectories, amortized over observation paths. The method handles noisy, partial, and irregularly-timed observations, and supports both filtering (causal) and smoothing (non-causal) inference at test time without retraining.
+We learn a conditional generative model that produces posterior distributions over latent trajectories, amortized over observation paths. The method handles noisy, partial, and irregularly-timed observations, and supports estimation of path functionals and the corresponding uncertainty quantification for new observations on updated time windows without retraining.
 
 Experiments cover stochastic **Lorenz-63**, **Lorenz-96**, and **MuJoCo Hopper** data.
 
