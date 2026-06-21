@@ -138,14 +138,29 @@ python lorenz96.py \
 
 ---
 
-### MuJoCo Hopper (evaluation only — requires a trained checkpoint)
+### MuJoCo Hopper
+
+**Train** (generates data automatically via `dm_control`, saves checkpoints to `train_dir`):
 
 ```bash
-python mujoco.py \
-    --model_ckpt ./path/to/model.pth \
+python mujoco.py train \
+    --data_dir  ./hopper_data/ \
+    --train_dir ./hopper_runs/ \
+    --num_iters 8000
+```
+
+Checkpoints are saved as `model_step_NNNNN.pth` / `gru_ar_step_NNNNN.pth` every `eval_every` steps, plus `model_best.pth` for the best W₂ on the hidden window.
+
+**Evaluate** a trained checkpoint:
+
+```bash
+python mujoco.py evaluate \
+    --model_ckpt ./hopper_runs/model_best.pth \
+    --gru_ckpt   ./hopper_runs/gru_ar_best.pth \
     --data_dir   ./hopper_data/ \
     --out_dir    ./hopper_eval/
 ```
+
 
 ---
 
