@@ -3,7 +3,7 @@ Neural path filtering of stochastic dynamical systems under partial observations
 
 We explore robust and accurate surrogate modeling of stochastic dynamical systems with noisy and partial observations, with the capability of uncertainty quantification and online inference for both filtering marginals and trajectory-dependent functionals. The method is a conditional generative model that gives posterior distribution of the system amortized over observation paths. The code is modified based on Latent SDEs [2].
 
-Experiments on Lorenz-96 and MuJoCo.
+Experiments on learning stochastic Lorenz-63, Lorenz-96 and MuJoCo simulator data from only noisy and partial observations.
 
 ## Dependencies
 
