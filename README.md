@@ -16,7 +16,7 @@ Experiments cover stochastic **Lorenz-63**, **Lorenz-96**, and **MuJoCo Hopper**
 
 The model is trained on the time interval [0, 2] with observation model y_t = tanh(x_t) + N(0, 0.15²) and 20% missing observations during training.
 
-**Quantitative comparison across missing rates** — model trained on [0, 3] with 20% observations masked; evaluated over 10 seeds against particle filter (PF, 512 particles) and particle smoother (PG, 512 particles). Our method uses only 64 posterior samples. **Bold** = best. Lower is better.
+**Quantitative comparison across missing rates** — model trained on [0, 3] with 20% observations masked; evaluated over 10 seeds against particle filter (PF, 512 particles) and particle smoother (PG, 512 particles). Our method uses only 64 posterior samples. <span style="color:green">Green</span> = best. Lower is better.
 
 <table>
 <thead>
@@ -31,8 +31,8 @@ The model is trained on the time interval [0, 2] with observation model y_t = ta
 <tr>
   <td rowspan="3">10%</td>
   <td>Ours</td>
-  <td><b>0.141 ± 0.002</b></td>
-  <td><b>0.104 ± 0.002</b></td>
+  <td><span style="color:green">0.141 ± 0.002</span></td>
+  <td><span style="color:green">0.104 ± 0.002</span></td>
 </tr>
 <tr>
   <td>PF</td>
@@ -47,8 +47,8 @@ The model is trained on the time interval [0, 2] with observation model y_t = ta
 <tr>
   <td rowspan="3">30%</td>
   <td>Ours</td>
-  <td><b>0.159 ± 0.002</b></td>
-  <td><b>0.117 ± 0.002</b></td>
+  <td><span style="color:green">0.159 ± 0.002</span></td>
+  <td><span style="color:green">0.117 ± 0.002</span></td>
 </tr>
 <tr>
   <td>PF</td>
@@ -63,8 +63,8 @@ The model is trained on the time interval [0, 2] with observation model y_t = ta
 <tr>
   <td rowspan="3">50%</td>
   <td>Ours</td>
-  <td><b>0.195 ± 0.002</b></td>
-  <td><b>0.137 ± 0.004</b></td>
+  <td><span style="color:green">0.195 ± 0.002</span></td>
+  <td><span style="color:green">0.137 ± 0.004</span></td>
 </tr>
 <tr>
   <td>PF</td>
