@@ -16,7 +16,7 @@ Experiments cover stochastic **Lorenz-63**, **Lorenz-96**, and **MuJoCo Hopper**
 
 The model is trained on the time interval [0, 2] with observation model y_t = tanh(x_t) + N(0, 0.15²) and 20% missing observations during training.
 
-**Quantitative comparison across missing rates** — model trained on [0, 3] with 20% observations masked; evaluated over 10 seeds against particle filter (PF, 512 particles) and particle smoother (PG, 512 particles). Our method uses only 64 posterior samples. <span style="color:green">Green</span> = best. Lower is better.
+**Quantitative comparison across missing rates** — model trained on [0, 3] with 20% observations masked; evaluated over 10 seeds against particle filter (PF, 512 particles) and particle smoother (PG, 512 particles). Our method uses only 64 posterior samples and yields better results in the comparison below.
 
 <table>
 <thead>
@@ -175,4 +175,4 @@ The SDE class must expose:
 
 [1] Yang, Nicole Tianjiao. "Pathwise Learning of Stochastic Dynamical Systems with Partial Observations." arXiv:2601.21860 (2026).
 
-[2] Li, Xuechen, et al. "Scalable gradients for stochastic differential equations." AISTATS 2020.
+[2] Li, Xuechen and Wong, Ting-Kam Leonard and Chen, Ricky T. Q. and Duvenaud, David. "Scalable gradients for stochastic differential equations." Proceedings of the Twenty Third International Conference on Artificial Intelligence and Statistics, PMLR 108:3870-3882, 2020.
