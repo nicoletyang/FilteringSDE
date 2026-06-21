@@ -589,6 +589,23 @@ class GridBatchSampler(Sampler[List[int]]):
 
 
 # -----------------------------------------------------------------------------
+# KL annealing scheduler
+# -----------------------------------------------------------------------------
+class LinearScheduler:
+    def __init__(self, iters, maxval=1.0):
+        self._iters = max(1, iters)
+        self._val = maxval / self._iters
+        self._maxval = maxval
+
+    def step(self):
+        self._val = min(self._maxval, self._val + self._maxval / self._iters)
+
+    @property
+    def val(self):
+        return self._val
+
+
+# -----------------------------------------------------------------------------
 # Model definitions
 # -----------------------------------------------------------------------------
 class Encoder(nn.Module):
@@ -872,6 +889,61 @@ class LatentSDE(nn.Module):
             out.append(torch.nn.functional.softplus(raw) + self.diffusion_floor)
         return torch.nan_to_num(torch.cat(out, dim=1), nan=self.diffusion_floor).clamp_min(self.diffusion_floor)
 
+    def state_loglik_on_mask(self, x_hat, xs, target_mask, x_recon_std):
+        dist_x = torch.distributions.Normal(loc=x_hat, scale=x_recon_std)
+        ll = dist_x.log_prob(xs) * target_mask
+        return ll.sum() / target_mask.sum().clamp_min(1.0)
+
+    def forward(
+        self,
+        xs,
+        obs,
+        ts,
+        mask,
+        hidden_mask,
+        x_recon_std,
+        adjoint=False,
+        method="euler",
+        dt_sde=1e-2,
+        x_recon_weight=1.0,
+        use_hidden_only_for_xloss=False,
+    ):
+        x_ctx_seq = self._encode_x_context(xs, ts)
+        _, obs_ctx_global = self._encode_obs_context(obs, ts, mask=mask)
+        self._ctx = (ts, x_ctx_seq, obs_ctx_global)
+
+        qz0_mean, qz0_logstd = self.qz0_net(obs_ctx_global).chunk(2, dim=1)
+        z0 = qz0_mean + qz0_logstd.exp() * torch.randn_like(qz0_mean)
+
+        if adjoint:
+            zs, log_ratio = torchsde.sdeint(self, z0, ts, dt=dt_sde, logqp=True, method=method)
+        else:
+            zs, log_ratio = sdeint_obs(self, z0, obs, ts, dt=dt_sde, logqp=True, method=method)
+
+        x_hat = self.decode_x(zs)
+
+        miss_mask = (mask == 0).float()
+        target_mask = hidden_mask if use_hidden_only_for_xloss else miss_mask
+        log_pxs = self.state_loglik_on_mask(x_hat, xs, target_mask, x_recon_std) * x_recon_weight
+
+        qz0 = torch.distributions.Normal(loc=qz0_mean, scale=qz0_logstd.exp())
+        if self.learn_mixture_prior:
+            logq0 = qz0.log_prob(z0).sum(dim=1)
+            z = z0.unsqueeze(1)
+            means = self.pz0_means.unsqueeze(0)
+            logstds = self.pz0_logstds.unsqueeze(0)
+            var = torch.exp(2.0 * logstds)
+            log_weights = torch.log_softmax(self.pz0_logits, dim=0).unsqueeze(0)
+            log_comp = -0.5 * (((z - means) ** 2) / var + 2.0 * logstds + math.log(2.0 * math.pi)).sum(dim=-1)
+            logp0 = torch.logsumexp(log_weights + log_comp, dim=1)
+            logqp0 = (logq0 - logp0).mean()
+        else:
+            pz0 = torch.distributions.Normal(loc=self.pz0_mean, scale=self.pz0_logstd.exp())
+            logqp0 = torch.distributions.kl_divergence(qz0, pz0).sum(dim=1).mean()
+
+        logqp_path = log_ratio.sum(dim=0).mean()
+        return log_pxs, logqp0 + logqp_path, x_hat
+
     def obs_score_z(self, z, y_t, mask_t, R_scalar):
         with torch.enable_grad():
             z_req = z.detach().requires_grad_(True)
@@ -970,6 +1042,7 @@ class GRUARFilter(nn.Module):
         y: torch.Tensor,
         mask: torch.Tensor,
         times: torch.Tensor,
+        x_true: Optional[torch.Tensor] = None,
         x0: Optional[torch.Tensor] = None,
         feedback: str = "sample",
         detach_feedback: bool = False,
@@ -1040,6 +1113,7 @@ class GRUARFilter(nn.Module):
                 y=y,
                 mask=mask,
                 times=times,
+                x_true=None,
                 x0=x0,
                 feedback=feedback,
                 detach_feedback=False,
@@ -2096,5 +2170,407 @@ def main(
     logging.info(f"Wrote outputs to {out_dir}")
 
 
+# -----------------------------------------------------------------------------
+# Training helpers
+# -----------------------------------------------------------------------------
+def _posterior_mean_rmse(x_samples: torch.Tensor, x_true: torch.Tensor) -> float:
+    mu = x_samples.mean(dim=0)
+    return torch.sqrt(((mu - x_true) ** 2).mean()).item()
+
+
+def _posterior_mean_rmse_on_mask(x_samples, x_true, eval_mask):
+    mu = x_samples.mean(dim=0)
+    use = eval_mask > 0
+    if use.sum().item() == 0:
+        return float("nan")
+    return torch.sqrt(((mu - x_true) ** 2)[use].mean()).item()
+
+
+def _gaussian_nll_x_on_mask(mu, logvar, x, target_mask):
+    import math as _math
+    var = torch.exp(logvar)
+    ll = -0.5 * ((x - mu) ** 2 / var + torch.log(
+        2 * torch.tensor(_math.pi, device=mu.device, dtype=mu.dtype) * var
+    ))
+    ll = ll * target_mask
+    return -(ll.sum() / target_mask.sum().clamp_min(1.0))
+
+
+def _aggregate_metrics(metric_dicts):
+    import math as _math
+    keys = metric_dicts[0].keys()
+    out = {}
+    for k in keys:
+        vals = [d[k] for d in metric_dicts if not (isinstance(d[k], float) and _math.isnan(d[k]))]
+        out[k] = float(np.mean(vals)) if vals else float("nan")
+    return out
+
+
+@torch.no_grad()
+def _evaluate_batch(model, gru, batch, device, R_scalar, L_samples, gain,
+                    use_explicit_likelihood, gru_feedback_eval, gru_warm_start_from_obs):
+    ts = batch["times"].to(device)
+    xs = batch["xs"].to(device)
+    ys = batch["ys"].to(device)
+    mask = batch["mask"].to(device)
+    hidden_mask = batch["hidden_mask"].to(device)
+
+    model.eval()
+    if gru is not None:
+        gru.eval()
+
+    x_samps_sde = model.euler_maruyama_posterior(
+        obs=ys, ts=ts, mask=mask, R_scalar=R_scalar,
+        L=L_samples, gain=gain, use_explicit_likelihood=use_explicit_likelihood,
+    )
+
+    x_samps_gru = None
+    if gru is not None:
+        x_samps_gru = gru.sample_posterior(
+            y=ys, mask=mask, times=ts, L=L_samples,
+            feedback=gru_feedback_eval, warm_start_from_obs=gru_warm_start_from_obs,
+        )
+
+    hidden_float = hidden_mask.float()
+    hidden_time = (hidden_float.sum(dim=-1) > 0).float()
+
+    metrics = {}
+    for tag, samps in [("sde", x_samps_sde), ("gru", x_samps_gru)]:
+        if samps is None:
+            metrics[f"{tag}_rmse_all"] = float("nan")
+            metrics[f"{tag}_rmse_hidden"] = float("nan")
+            metrics[f"{tag}_w2_path"] = float("nan")
+            metrics[f"{tag}_w2_hidden"] = float("nan")
+            continue
+        metrics[f"{tag}_rmse_all"] = _posterior_mean_rmse(samps, xs)
+        metrics[f"{tag}_rmse_hidden"] = _posterior_mean_rmse_on_mask(samps, xs, hidden_float)
+        metrics[f"{tag}_w2_path"] = pathwise_wasserstein_to_truth(samps, xs, eval_time_mask=None, p=2)
+        metrics[f"{tag}_w2_hidden"] = pathwise_wasserstein_to_truth(samps, xs, eval_time_mask=hidden_time, p=2)
+
+    return {
+        "metrics": metrics,
+        "x_samps_sde": x_samps_sde,
+        "x_samps_gru": x_samps_gru,
+        "ts": ts, "xs": xs, "ys": ys, "mask": mask, "hidden_mask": hidden_mask,
+    }
+
+
+@torch.no_grad()
+def _evaluate_testset(model, gru, test_loader, device, R_scalar, L_samples, gain,
+                      use_explicit_likelihood, gru_feedback_eval, gru_warm_start_from_obs,
+                      max_eval_batches=4):
+    all_metrics = []
+    first = None
+    for i, batch in enumerate(test_loader):
+        if i >= max_eval_batches:
+            break
+        out = _evaluate_batch(model, gru, batch, device, R_scalar, L_samples, gain,
+                              use_explicit_likelihood, gru_feedback_eval, gru_warm_start_from_obs)
+        all_metrics.append(out["metrics"])
+        if first is None:
+            first = out
+    return {"metrics": _aggregate_metrics(all_metrics), "example": first}
+
+
+def _plot_traj_compare(out_path, ts, x_true, x_sde_mu, mask, hidden_mask,
+                       x_gru_mu=None, dims=6, title="Trajectory comparison"):
+    ts_np = ts.detach().cpu().numpy()
+    D = x_true.shape[1]
+    dims = min(dims, D)
+    fig, axes = plt.subplots(dims, 1, figsize=(12, 2.4 * dims), sharex=True)
+    if dims == 1:
+        axes = [axes]
+    for d in range(dims):
+        ax = axes[d]
+        xt = x_true[:, d].detach().cpu().numpy()
+        mk = mask[:, d].detach().cpu().numpy().astype(bool)
+        hk = hidden_mask[:, d].detach().cpu().numpy().astype(bool)
+        ax.plot(ts_np, xt, color="black", lw=1.2, alpha=0.7, label="Truth")
+        ax.plot(ts_np, x_sde_mu[:, d].detach().cpu().numpy(), lw=1.4, label="LatentSDE")
+        if x_gru_mu is not None:
+            ax.plot(ts_np, x_gru_mu[:, d].detach().cpu().numpy(), lw=1.4, label="GRU-AR")
+        ax.plot(ts_np[mk], xt[mk], "k.", markersize=3)
+        if hk.any():
+            segs = np.split(np.where(hk)[0], np.where(np.diff(np.where(hk)[0]) != 1)[0] + 1)
+            for seg in segs:
+                if len(seg):
+                    ax.axvspan(ts_np[seg[0]], ts_np[seg[-1]], color="gray", alpha=0.15)
+        ax.set_ylabel(f"dim {d}")
+        ax.grid(True, alpha=0.3)
+        if d == 0:
+            ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("t")
+    plt.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    logging.info(f"Saved {out_path}")
+
+
+# -----------------------------------------------------------------------------
+# Training entry point
+# -----------------------------------------------------------------------------
+def train(
+    data_dir: str = "./hopper_data",
+    train_dir: str = "./hopper_runs",
+    seed: int = 0,
+    device: str = "",
+
+    num_trajs_train: int = 4000,
+    num_trajs_test: int = 1000,
+    T_use: int = 100,
+    internal_len: int = 400,
+    num_time_grids: int = 16,
+
+    num_modes: int = 3,
+    pulse_start_min_frac: float = 0.30,
+    pulse_start_max_frac: float = 0.55,
+    pulse_len_min_frac: float = 0.10,
+    pulse_len_max_frac: float = 0.22,
+    pulse_scale: float = 0.51,
+
+    obs_noise_std: float = 0.35,
+    keep_time_prob: float = 0.70,
+    drop_dim_prob: float = 0.15,
+    num_hidden_windows: int = 4,
+    hidden_window_min_frac: float = 0.10,
+    hidden_window_max_frac: float = 0.15,
+    force_observe_prefix_frac: float = 0.25,
+    force_mask_future_window: bool = True,
+    future_window_min_frac: float = 0.58,
+    future_window_max_frac: float = 0.75,
+    irregularity_strength: float = 0.8,
+    state_noise_std: float = 0.08,
+
+    latent_size: int = 15,
+    context_size: int = 32,
+    hidden_size: int = 512,
+    ctxobs_size: int = 32,
+    num_heads: int = 4,
+    causal: bool = True,
+    decoder_hidden: int = 64,
+    diffusion_floor: float = 0.20,
+    learn_mixture_prior: bool = True,
+    mixture_components: int = 3,
+
+    gru_hidden: int = 256,
+    gru_feedback_train: str = "sample",
+    gru_feedback_eval: str = "sample",
+    gru_detach_feedback: bool = False,
+    gru_warm_start_from_obs: bool = False,
+
+    batch_size: int = 128,
+    num_iters: int = 8000,
+    lr: float = 1e-3,
+    kl_anneal_iters: int = 3000,
+    x_recon_weight: float = 1.0,
+    kl_path_weight: float = 1.0,
+    use_hidden_only_for_xloss: bool = True,
+    method: str = "euler",
+    dt_sde: float = 1e-2,
+
+    eval_every: int = 500,
+    L_samples: int = 64,
+    gain: float = 1.0,
+    use_explicit_likelihood: bool = True,
+    max_eval_batches: int = 3,
+    patience: int = 10,
+):
+    """Train LatentSDE + GRU-AR baseline on MuJoCo Hopper data.
+
+    Checkpoints are saved to train_dir every eval_every steps.
+    Pass the saved model_*.pth to `evaluate` to run the full eval suite.
+    """
+    import copy
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if not device:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
+    os.makedirs(train_dir, exist_ok=True)
+
+    payload_train = load_hopperphysics_irregular(
+        data_dir=data_dir, num_trajs=num_trajs_train, T_obs=T_use,
+        internal_len=internal_len, num_time_grids=num_time_grids, seed=seed,
+        num_modes=num_modes, pulse_start_min_frac=pulse_start_min_frac,
+        pulse_start_max_frac=pulse_start_max_frac, pulse_len_min_frac=pulse_len_min_frac,
+        pulse_len_max_frac=pulse_len_max_frac, pulse_scale=pulse_scale,
+        irregularity_strength=irregularity_strength, max_time=1.0,
+    )
+    payload_test = load_hopperphysics_irregular(
+        data_dir=data_dir, num_trajs=num_trajs_test, T_obs=T_use * 2,
+        internal_len=internal_len * 2, num_time_grids=num_time_grids, seed=seed + 1,
+        num_modes=num_modes, pulse_start_min_frac=pulse_start_min_frac,
+        pulse_start_max_frac=pulse_start_max_frac, pulse_len_min_frac=pulse_len_min_frac,
+        pulse_len_max_frac=pulse_len_max_frac, pulse_scale=pulse_scale,
+        irregularity_strength=irregularity_strength, max_time=2.0,
+    )
+
+    stats = compute_stats(payload_train["x"])
+    cfg = HopperConfig(
+        obs_noise_std=obs_noise_std, keep_time_prob=keep_time_prob, drop_dim_prob=drop_dim_prob,
+        T_use=T_use, num_hidden_windows=num_hidden_windows,
+        hidden_window_min_frac=hidden_window_min_frac, hidden_window_max_frac=hidden_window_max_frac,
+        irregularity_strength=irregularity_strength, state_noise_std=state_noise_std,
+        force_observe_initial=True, force_observe_final=False,
+        force_observe_prefix_frac=force_observe_prefix_frac,
+        force_mask_future_window=force_mask_future_window,
+        future_window_min_frac=future_window_min_frac, future_window_max_frac=future_window_max_frac,
+    )
+    cfg_test = copy.deepcopy(cfg)
+    cfg_test.T_use = T_use * 2
+
+    train_ds = HopperPhysicsIrregularDataset(payload_train, stats=stats, cfg=cfg, seed=seed)
+    test_ds = HopperPhysicsIrregularDataset(payload_test, stats=stats, cfg=cfg_test, seed=seed + 1)
+
+    train_sampler = GridBatchSampler(payload_train["grid_id"], batch_size=batch_size, shuffle=True, seed=seed)
+    test_sampler = GridBatchSampler(payload_test["grid_id"], batch_size=batch_size, shuffle=False, seed=seed + 1)
+    train_loader = DataLoader(train_ds, batch_sampler=train_sampler, collate_fn=collate_hopper_irregular)
+    test_loader = DataLoader(test_ds, batch_sampler=test_sampler, collate_fn=collate_hopper_irregular)
+
+    D = int(payload_train["x"].shape[-1])
+    R_scalar = obs_noise_std ** 2
+    x_recon_std = obs_noise_std
+
+    model = LatentSDE(
+        data_size=D, latent_size=latent_size, context_size=context_size,
+        hidden_size=hidden_size, ctxobs_size=ctxobs_size, num_heads=num_heads,
+        causal=causal, decoder_hidden=decoder_hidden, diffusion_floor=diffusion_floor,
+        learn_mixture_prior=learn_mixture_prior, mixture_components=mixture_components,
+    ).to(device)
+
+    gru = GRUARFilter(D=D, H=gru_hidden).to(device)
+
+    # Resume from latest checkpoint if available
+    import glob as _glob
+    existing = sorted(_glob.glob(os.path.join(train_dir, "model_step_*.pth")))
+    if existing:
+        model.load_state_dict(torch.load(existing[-1], map_location=device))
+        gru_ckpt = existing[-1].replace("model_step_", "gru_ar_step_")
+        if os.path.exists(gru_ckpt):
+            gru.load_state_dict(torch.load(gru_ckpt, map_location=device))
+        logging.info(f"Resumed from {existing[-1]}")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer_gru = torch.optim.Adam(gru.parameters(), lr=lr)
+    lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_iters)
+    lr_sched_gru = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_gru, T_max=num_iters)
+    kl_sched = LinearScheduler(iters=kl_anneal_iters)
+
+    mean = stats["mean"].to(device)
+    std = stats["std"].to(device)
+
+    train_sampler.set_epoch(0)
+    train_iter = iter(train_loader)
+    epoch_counter = 0
+    best_w2 = float("inf")
+    no_improve_count = 0
+
+    logging.info(f"Training: N_train={len(train_ds)} N_test={len(test_ds)} D={D}")
+
+    for step in tqdm.tqdm(range(1, num_iters + 1)):
+        model.train()
+        gru.train()
+        optimizer.zero_grad(set_to_none=True)
+        optimizer_gru.zero_grad(set_to_none=True)
+
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            epoch_counter += 1
+            train_sampler.set_epoch(epoch_counter)
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+
+        ts = batch["times"].to(device)
+        xs = batch["xs"].to(device)
+        ys = batch["ys"].to(device)
+        mask = batch["mask"].to(device)
+        hidden_mask = batch["hidden_mask"].to(device)
+
+        log_pxs, log_ratio, _ = model(
+            xs=xs, obs=ys, ts=ts, mask=mask, hidden_mask=hidden_mask,
+            x_recon_std=x_recon_std, adjoint=False, method=method, dt_sde=dt_sde,
+            x_recon_weight=x_recon_weight, use_hidden_only_for_xloss=use_hidden_only_for_xloss,
+        )
+        beta = kl_sched.val
+        loss_sde = -log_pxs + beta * kl_path_weight * log_ratio
+        loss_sde.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        lr_sched.step()
+        kl_sched.step()
+
+        mu_x, logvar_x, _ = gru.forward_autoregressive(
+            y=ys, mask=mask, times=ts, x_true=xs, x0=None,
+            feedback=gru_feedback_train, detach_feedback=gru_detach_feedback,
+            warm_start_from_obs=gru_warm_start_from_obs,
+        )
+        gru_target_mask = hidden_mask if use_hidden_only_for_xloss else (mask == 0).float()
+        loss_gru = _gaussian_nll_x_on_mask(mu_x[1:], logvar_x[1:], xs[1:], gru_target_mask[1:])
+        loss_gru.backward()
+        torch.nn.utils.clip_grad_norm_(gru.parameters(), 1.0)
+        optimizer_gru.step()
+        lr_sched_gru.step()
+
+        if step % 100 == 0:
+            logging.info(
+                f"Step {step:05d} | SDE loss={loss_sde.item():.4f} "
+                f"(pxs={log_pxs.item():.3f} kl={log_ratio.item():.3f} beta={beta:.3f}) | "
+                f"GRU loss={loss_gru.item():.4f}"
+            )
+
+        if step % eval_every == 0:
+            out = _evaluate_testset(
+                model, gru, test_loader, device, R_scalar, L_samples, gain,
+                use_explicit_likelihood, gru_feedback_eval, gru_warm_start_from_obs,
+                max_eval_batches=max_eval_batches,
+            )
+            m = out["metrics"]
+            logging.warning(
+                f"[Eval @ {step}] "
+                f"SDE: RMSE_all={m['sde_rmse_all']:.4f} RMSE_hidden={m['sde_rmse_hidden']:.4f} "
+                f"W2_path={m['sde_w2_path']:.4f} W2_hidden={m['sde_w2_hidden']:.4f} | "
+                f"GRU: RMSE_all={m['gru_rmse_all']:.4f} RMSE_hidden={m['gru_rmse_hidden']:.4f} "
+                f"W2_path={m['gru_w2_path']:.4f} W2_hidden={m['gru_w2_hidden']:.4f}"
+            )
+
+            ex = out["example"]
+            b = 0
+            _plot_traj_compare(
+                out_path=os.path.join(train_dir, f"traj_step_{step:05d}.png"),
+                ts=ex["ts"], x_true=ex["xs"][:, b, :],
+                x_sde_mu=ex["x_samps_sde"].mean(dim=0)[:, b, :],
+                mask=ex["mask"][:, b, :], hidden_mask=ex["hidden_mask"][:, b, :],
+                x_gru_mu=ex["x_samps_gru"].mean(dim=0)[:, b, :] if ex["x_samps_gru"] is not None else None,
+                dims=6, title=f"Hopper step {step}",
+            )
+
+            torch.save(model.state_dict(), os.path.join(train_dir, f"model_step_{step:05d}.pth"))
+            torch.save(gru.state_dict(), os.path.join(train_dir, f"gru_ar_step_{step:05d}.pth"))
+            logging.info(f"Saved checkpoints @ step {step}")
+
+            w2 = m["sde_w2_hidden"]
+            import math as _math
+            if not _math.isnan(w2) and w2 < best_w2:
+                best_w2 = w2
+                no_improve_count = 0
+                torch.save(model.state_dict(), os.path.join(train_dir, "model_best.pth"))
+                torch.save(gru.state_dict(), os.path.join(train_dir, "gru_ar_best.pth"))
+            else:
+                no_improve_count += 1
+            logging.info(f"[EarlyStopping] W2_hidden={w2:.4f} best={best_w2:.4f} no_improve={no_improve_count}/{patience}")
+            if no_improve_count >= patience:
+                logging.warning(f"Early stopping at step {step}.")
+                break
+
+    torch.save(model.state_dict(), os.path.join(train_dir, "model_final.pth"))
+    torch.save(gru.state_dict(), os.path.join(train_dir, "gru_ar_final.pth"))
+    logging.info(f"Training complete. Checkpoints in {train_dir}")
+
+
 if __name__ == "__main__":
-    fire.Fire(main)
+    # `python mujoco.py train`    -> train LatentSDE + GRU-AR on Hopper data
+    # `python mujoco.py evaluate` -> eval-only on pre-trained checkpoints
+    fire.Fire({"train": train, "evaluate": main})
