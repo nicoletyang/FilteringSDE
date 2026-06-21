@@ -1658,16 +1658,17 @@ def pathwise_w2_per_dim(
 # Main evaluation-only script
 # -----------------------------------------------------------------------------
 def main(
-    model_ckpt: str = "./hopper_pathwise_runs_multimodal_irregular_hctrl5/model_step_08000.pth",
-    gru_ckpt: str = "./hopper_pathwise_runs_multimodal_irregular_hctrl5/gru_ar_step_08000.pth",
-    data_dir: str = "./train_hopperphysics_pathwise_multimodal_irregular_hctrl5",
-    out_dir: str = "./future_mask_eval_irregulartestlong5hctrl_irr8000_s0",
+    model_ckpt: str = "",
+    gru_ckpt: str = "",
+    data_dir: str = "./hopper_data",
+    out_dir: str = "./hopper_eval",
     seed: int = 0,
     device: str = "",
     sample_index_in_batch: int = 0,
     batch_size: int = 128,
     L_samples: int = 512,
 
+    num_trajs: int = 20000,
     num_modes: int = 3,
     pulse_start_min_frac: float = 0.30,
     pulse_start_max_frac: float = 0.55,
@@ -1720,9 +1721,12 @@ def main(
     device = torch.device(device)
     os.makedirs(out_dir, exist_ok=True)
 
+    if not model_ckpt:
+        raise ValueError("model_ckpt must be specified. Pass --model_ckpt path/to/model.pth")
+
     payload = load_hopperphysics_irregular(
         data_dir=data_dir,
-        num_trajs=20000,
+        num_trajs=num_trajs,
         T_obs=T_use,
         internal_len=internal_len,
         num_time_grids=num_time_grids,

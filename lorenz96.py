@@ -147,7 +147,6 @@ def make_dataset(t0, t1, batch_size, noise_std, train_dir, device,
 
     ts = torch.linspace(t0, t1, steps=steps, device=device)
     x0 = torch.randn(batch_size, D, device=device)
-    # xs_raw = StochasticLorenz63().sample(x0, ts)
     xs_raw = StochasticLorenz96(dim=D).sample(x0, ts)
 
     if normalize:
@@ -182,7 +181,6 @@ def make_testdataset(t0, t1, batch_size, noise_std, train_dir, device,
 
     ts = torch.linspace(t0, t1, steps=steps, device=device)
     x0 = torch.randn(batch_size, D, device=device)
-    # xs_raw = StochasticLorenz63().sample(x0, ts)
     xs_raw = StochasticLorenz96(dim=D).sample(x0, ts)
 
     if normalize:
@@ -649,8 +647,7 @@ class BootstrapParticleFilter:
 
     @torch.no_grad()
     def run(self, y_seq, ts, x0_mean, x0_std, device, mask=None):
-        T, B, _ = y_seq.shape
-        D = 15
+        T, B, D = y_seq.shape
         particles = x0_mean.unsqueeze(0) + x0_std * torch.randn(self.num_particles, B, D, device=device)
         weights = torch.ones(self.num_particles, B, device=device) / self.num_particles
         history = torch.zeros(T, self.num_particles, B, D, device=device)
@@ -698,8 +695,7 @@ class ParticleSmoother:
 
     @torch.no_grad()
     def run_smoother(self, y_seq, ts, x0_mean, x0_std, device, mask=None):
-        T, B, _ = y_seq.shape
-        D = 15
+        T, B, D = y_seq.shape
         trajectories = torch.zeros(T, self.num_particles, B, D, device=device)
         particles = x0_mean.unsqueeze(0) + x0_std * torch.randn(self.num_particles, B, D, device=device)
         weights = torch.ones(self.num_particles, B, device=device) / self.num_particles
@@ -835,10 +831,10 @@ def main(
     steps_train: int = 300,
     steps_test: int = 300,
     batch_size: int = 256,
-    seed: int = 0, #42,32,22,12,2
+    seed: int = 0,
     obs_noise_std: float = 0.15,
 
-    missing_rate_train: float = 0.2, #Probability of missing observation
+    missing_rate_train: float = 0.2,
     missing_rate_test: float = 0.5,
 
     latent_size: int = 16,
@@ -846,7 +842,11 @@ def main(
     hidden_size: int = 512,
     lr_init: float = 1e-3,
     num_iters: int = 5000,
-    
+    save_every: int = 300,
+    test_horizon_mult: float = 2.0,
+    pf_x0_std: float = 0.1,
+    l_samples: int = 256,
+
     train_dir: str = "./dump/l96/",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -858,23 +858,18 @@ def main(
     if train_mean is not None:
         train_mean = train_mean.to(device)
         train_std = train_std.to(device)
-    
-    # xs_test, ts_test = make_testdataset(t0, t1, batch_size, 0.01, train_dir, device, steps=steps_test, D=data_dim)
-    t1_test = t1 * 2
-    steps_test_ext = steps_test * 2
+
+    t1_test = t1 * test_horizon_mult
+    steps_test_ext = int(steps_test * test_horizon_mult)
     xs_test, ts_test = make_testdataset(t0, t1_test, batch_size, 0.01, train_dir, device, steps=steps_test_ext, D=data_dim)
 
     # 2. Observations & Mask Generation
     ys_train = torch.atan(xs_train) + obs_noise_std * torch.randn_like(xs_train)
     ys_test = torch.atan(xs_test) + obs_noise_std * torch.randn_like(xs_test)
 
-    # Generate Masks (1=Observed, 0=Missing)
-    # Mask per time-step (same across D for simplicity, or per D)
-    # Let's do per-element mask
     mask_train = torch.bernoulli(torch.full_like(ys_train, 1 - missing_rate_train))
     mask_test = torch.bernoulli(torch.full_like(ys_test, 1 - missing_rate_test))
-    
-    # Zero out missing values in input (Placeholder logic)
+
     ys_train = ys_train * mask_train
     ys_test = ys_test * mask_test
 
@@ -884,17 +879,18 @@ def main(
     # 3. Model
     model = LatentSDE(data_dim, latent_size, context_size, hidden_size, steps_train).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr_init)
-    
-    # 4. Train
-    modelpath = os.path.join(train_dir, 'model_step_4800.pth')
 
-    if os.path.exists(modelpath):
+    # 4. Train — load latest checkpoint if one exists
+    import glob as _glob
+    existing = sorted(_glob.glob(os.path.join(train_dir, "model_step_*.pth")))
+    if existing:
+        modelpath = existing[-1]
         model.load_state_dict(torch.load(modelpath, map_location=device))
         logging.info(f"Loaded existing model from {modelpath}")
     else:
+        import time as _time
         for step in tqdm.tqdm(range(1, num_iters + 1)):
             model.zero_grad()
-            # Pass Mask to Forward
             log_pxs, log_py, log_kl, _ = model(
                 xs_train, ys_train, ts_train, obs_noise_std, H, R, mask=mask_train
             )
@@ -902,18 +898,16 @@ def main(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            if step % 300 == 0:
+            if step % save_every == 0:
                 logging.info(f"Step {step} | Loss: {loss.item():.3f}")
-                import time as _time
                 with open(os.path.join(train_dir, "training_log.txt"), "a") as _logf:
                     _logf.write(f"[{_time.strftime('%Y-%m-%d %H:%M:%S')}] Step {step} | Loss: {loss.item():.6f}\n")
                 plot_step(
                     step, xs_train, ys_train, model.sample_posterior_paths_em(
-                        ys_train, ts_train, ts_train, H, R, L=256, gain=1.0, x0=xs_train[0], mask=mask_train
+                        ys_train, ts_train, ts_train, H, R, L=l_samples, gain=1.0, x0=xs_train[0], mask=mask_train
                     ), ts_train, train_dir, sample_idx=0, seed_idx=seed
                 )
                 model_path = os.path.join(train_dir, f'model_step_{step}.pth')
-
                 torch.save(model.state_dict(), model_path)
                 logging.info(f"Saved model to {model_path}")
 
@@ -923,9 +917,8 @@ def main(
     logging.info("Starting Final Evaluation...")
     with torch.no_grad():
         # A. Latent SDE
-        # Pass test mask
         x_samples_model = model.sample_posterior_paths_em(
-            ys_test, ts_test, ts_test, H, R, L=256, gain=1.0, x0=xs_test[0], mask=mask_test
+            ys_test, ts_test, ts_test, H, R, L=l_samples, gain=1.0, x0=xs_test[0], mask=mask_test
         )
 
         # B. PF/Smoother Setup
@@ -937,7 +930,7 @@ def main(
         pf_smoother = ParticleSmoother(norm_physics, pf_obs, num_particles=512)
         
         x0_norm = xs_test[0]
-        x0_std_norm = torch.tensor(0.1, device=device)
+        x0_std_norm = torch.tensor(float(pf_x0_std), device=device)
         
         # C. Run Filter (pass mask)
         logging.info("Running Particle Filter...")

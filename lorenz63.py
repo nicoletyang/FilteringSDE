@@ -1,6 +1,8 @@
+import glob
 import logging
 import os
 import math
+import re
 from typing import Dict, Tuple, Optional
 
 import fire
@@ -15,7 +17,6 @@ from torch.distributions import Normal
 import torchsde
 from sdeint_obs import sdeint_obs
 
-# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 
@@ -848,13 +849,15 @@ def train_or_load_model(
 # =========================
 # Inference-only multi-seed evaluation
 # =========================
-DEFAULT_SEED_DIRS = (
-    "./dump/l63_s0/",
-    "./dump/l63_s1/",
-    "./dump/l63_s2/",
-    "./dump/l63_s3/",
-    "./dump/l63_s4/",
-)
+def _discover_seed_dirs(base_dir: str) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+    """Auto-discover seed subdirectories under base_dir named seed<N>."""
+    dirs, seeds = [], []
+    for d in sorted(glob.glob(os.path.join(base_dir, "seed*"))):
+        m = re.search(r"seed(\d+)$", d)
+        if m and os.path.isdir(d):
+            dirs.append(d + os.sep)
+            seeds.append(int(m.group(1)))
+    return tuple(dirs), tuple(seeds)
 
 
 def _build_latent_sde(data_dim, latent_size, context_size, hidden_size,
@@ -873,8 +876,9 @@ def _build_latent_sde(data_dim, latent_size, context_size, hidden_size,
 
 
 def evaluate_seeds(
-    seed_dirs: Tuple[str, ...] = DEFAULT_SEED_DIRS,
-    seeds: Tuple[int, ...] = (0, 1, 2, 3, 4),
+    base_dir: str = "./dump/l63/",
+    seed_dirs: Tuple[str, ...] = (),
+    seeds: Tuple[int, ...] = (),
     data_dim: int = 3,
     obs_noise_std: float = 0.15,
     missing_rate_test: float = 0.0,
@@ -911,6 +915,11 @@ def evaluate_seeds(
         seed_dirs = (seed_dirs,)
     if isinstance(seeds, int):
         seeds = (seeds,)
+    if not seed_dirs:
+        seed_dirs, seeds = _discover_seed_dirs(base_dir)
+        if not seed_dirs:
+            logging.error(f"No seed*/  subdirectories found under {base_dir}. Train first.")
+            return None
     assert len(seed_dirs) == len(seeds), "seed_dirs and seeds must have equal length"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1125,8 +1134,9 @@ def plot_budget_curves(results, methods, out_path):
 
 
 def budget_sweep(
-    seed_dirs: Tuple[str, ...] = DEFAULT_SEED_DIRS,
-    seeds: Tuple[int, ...] = (0, 1, 2, 3, 4),
+    base_dir: str = "./dump/l63/",
+    seed_dirs: Tuple[str, ...] = (),
+    seeds: Tuple[int, ...] = (),
     sample_grid: Tuple[int, ...] = (8, 16, 32, 64, 128, 256, 512),         # Ours: # posterior samples L
     particle_grid: Tuple[int, ...] = (16, 32, 64, 128, 256, 512),  # PF/PG: # particles N
     data_dim: int = 3,
@@ -1164,6 +1174,11 @@ def budget_sweep(
         seed_dirs = (seed_dirs,)
     if isinstance(seeds, int):
         seeds = (seeds,)
+    if not seed_dirs:
+        seed_dirs, seeds = _discover_seed_dirs(base_dir)
+        if not seed_dirs:
+            logging.error(f"No seed*/  subdirectories found under {base_dir}. Train first.")
+            return None
     assert len(seed_dirs) == len(seeds), "seed_dirs and seeds must have equal length"
     sample_grid = tuple(sorted({int(x) for x in sample_grid}))
     particle_grid = tuple(sorted({int(x) for x in particle_grid}))
@@ -1306,6 +1321,7 @@ def main(
     latent_size: int = 4,
     context_size: int = 128,
     hidden_size: int = 256,
+    ctxobs_size: int = 64,
     lr_init: float = 1e-3,
     num_iters: int = 500,
     save_every: int = 100,
@@ -1324,10 +1340,14 @@ def main(
     pf_x0_std: float = 0.10,
     l_samples: int = 64,
 
-    train_dir: str = "./dump/l63_s0/",
+    base_dir: str = "",
+    train_dir: str = "",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(seed)
+    if not train_dir:
+        _base = base_dir if base_dir else "./dump/l63/"
+        train_dir = os.path.join(_base, f"seed{seed}")
     ensure_dir(train_dir)
 
     l63_params = dict(
@@ -1373,7 +1393,7 @@ def main(
         latent_size=latent_size,
         context_size=context_size,
         hidden_size=hidden_size,
-        ctxobs_size=64,
+        ctxobs_size=ctxobs_size,
         num_heads=2,
         time_d=32,
         obs_noise_std=obs_noise_std,
@@ -1386,7 +1406,7 @@ def main(
         latent_size=latent_size,
         context_size=context_size,
         hidden_size=hidden_size,
-        ctxobs_size=64,
+        ctxobs_size=ctxobs_size,
         num_heads=2,
         time_d=32,
         obs_noise_std=obs_noise_std,
@@ -1534,8 +1554,65 @@ def main(
         logging.info(f"Saved plots to {train_dir}")
 
 
+# =========================
+# Multi-seed training
+# =========================
+def train_seeds(
+    seeds: Tuple[int, ...] = (0, 1, 2, 3, 4),
+    base_dir: str = "./dump/l63/",
+    data_dim: int = 3,
+    obs_dim: int = 3,
+    t0: float = 0.0,
+    t1: float = 2.0,
+    steps_train: int = 100,
+    steps_test: int = 100,
+    batch_size: int = 256,
+    obs_noise_std: float = 0.15,
+    missing_rate_train: float = 0.0,
+    missing_rate_test: float = 0.0,
+    latent_size: int = 4,
+    context_size: int = 128,
+    hidden_size: int = 256,
+    ctxobs_size: int = 64,
+    lr_init: float = 1e-3,
+    num_iters: int = 500,
+    save_every: int = 100,
+    sim_dt: float = 1e-3,
+    sim_method: str = "euler",
+    theta1: float = 10.0,
+    theta2: float = 28.0,
+    theta3: float = 8.0 / 3.0,
+    beta1: float = 0.1,
+    beta2: float = 0.28,
+    beta3: float = 0.3,
+    pf_num_particles: int = 512,
+    pf_x0_std: float = 0.10,
+    l_samples: int = 64,
+):
+    """Train independent seeds sequentially, each into {base_dir}/seed<N>/."""
+    if isinstance(seeds, int):
+        seeds = (seeds,)
+    for s in seeds:
+        logging.info(f"=== Training seed {s} ===")
+        main(
+            data_dim=data_dim, obs_dim=obs_dim, t0=t0, t1=t1,
+            steps_train=steps_train, steps_test=steps_test, batch_size=batch_size,
+            seed=s, obs_noise_std=obs_noise_std,
+            missing_rate_train=missing_rate_train, missing_rate_test=missing_rate_test,
+            latent_size=latent_size, context_size=context_size, hidden_size=hidden_size,
+            ctxobs_size=ctxobs_size, lr_init=lr_init, num_iters=num_iters,
+            save_every=save_every, sim_dt=sim_dt, sim_method=sim_method,
+            theta1=theta1, theta2=theta2, theta3=theta3,
+            beta1=beta1, beta2=beta2, beta3=beta3,
+            pf_num_particles=pf_num_particles, pf_x0_std=pf_x0_std, l_samples=l_samples,
+            base_dir=base_dir,
+        )
+
+
 if __name__ == "__main__":
-    # `python lorenz63.py eval`   -> inference-only single-budget multi-seed evaluation
-    # `python lorenz63.py sweep`  -> inference-only sample/particle-efficiency sweep
-    # `python lorenz63.py train`  -> single-seed training
-    fire.Fire({"eval": evaluate_seeds, "sweep": budget_sweep, "train": main})
+    # `python lorenz63.py train`        -> single-seed training (auto-names dir by seed)
+    # `python lorenz63.py train_seeds`  -> train all seeds sequentially
+    # `python lorenz63.py eval`         -> inference-only multi-seed evaluation (auto-discovers seeds)
+    # `python lorenz63.py sweep`        -> sample/particle-efficiency sweep (auto-discovers seeds)
+    fire.Fire({"train": main, "train_seeds": train_seeds,
+               "eval": evaluate_seeds, "sweep": budget_sweep})
