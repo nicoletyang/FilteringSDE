@@ -12,21 +12,75 @@ Experiments cover stochastic **Lorenz-63**, **Lorenz-96**, and **MuJoCo Hopper**
 
 ## Results
 
-### Lorenz-63: posterior mean vs. ground truth (Ours vs. PF vs. PG smoother)
+### Lorenz-96: learned posterior on 15-dimensional stochastic system
 
-![L63 benchmark](figs/l63_triptych.png)
+The model is trained on the time interval [0, 2] with observation model y_t = tanh(x_t) + N(0, 0.15²) and 20% missing observations during training.
 
-### Lorenz-63: inference-budget efficiency curve (RMSE and W₁ vs. # samples / particles)
+**Quantitative comparison across missing rates** — model trained on [0, 3] with 20% observations masked; evaluated over 10 seeds against particle filter (PF, 512 particles) and particle smoother (PG, 512 particles). Our method uses only 64 posterior samples. **Bold** = best. Lower is better.
 
-Ours matches particle-filter accuracy with far fewer samples because inference is amortized.
-
-![L63 budget curves](figs/l63_budget.png)
+<table>
+<thead>
+<tr>
+  <th>Missing Rate</th>
+  <th>Method</th>
+  <th>RMSE</th>
+  <th>W₁</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td rowspan="3">10%</td>
+  <td>Ours</td>
+  <td><b>0.141 ± 0.002</b></td>
+  <td><b>0.104 ± 0.002</b></td>
+</tr>
+<tr>
+  <td>PF</td>
+  <td>0.223 ± 0.004</td>
+  <td>0.128 ± 0.010</td>
+</tr>
+<tr>
+  <td>PG</td>
+  <td>0.219 ± 0.005</td>
+  <td>0.106 ± 0.006</td>
+</tr>
+<tr>
+  <td rowspan="3">30%</td>
+  <td>Ours</td>
+  <td><b>0.159 ± 0.002</b></td>
+  <td><b>0.117 ± 0.002</b></td>
+</tr>
+<tr>
+  <td>PF</td>
+  <td>0.281 ± 0.004</td>
+  <td>0.182 ± 0.016</td>
+</tr>
+<tr>
+  <td>PG</td>
+  <td>0.280 ± 0.004</td>
+  <td>0.153 ± 0.020</td>
+</tr>
+<tr>
+  <td rowspan="3">50%</td>
+  <td>Ours</td>
+  <td><b>0.195 ± 0.002</b></td>
+  <td><b>0.137 ± 0.004</b></td>
+</tr>
+<tr>
+  <td>PF</td>
+  <td>0.377 ± 0.004</td>
+  <td>0.237 ± 0.021</td>
+</tr>
+<tr>
+  <td>PG</td>
+  <td>0.378 ± 0.003</td>
+  <td>0.242 ± 0.026</td>
+</tr>
+</tbody>
+</table>
 
 ---
 
-### Lorenz-96: learned posterior on 15-dimensional stochastic system
-
-The model is trained on the time interval [0, 2] with observation model y_t = tanh(x_t) + N(0, 0.15²) and 20% missing observations during training, 50% at test time. Inference is performed on an extended test horizon [0, 4].
 
 **Marginal posterior distributions** at t = 0.5, 1.0, 1.5 for dimension 1 — posterior samples (histogram) tightly bracket the ground-truth value (blue dashed line) across all three snapshots:
 
