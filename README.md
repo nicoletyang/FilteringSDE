@@ -10,7 +10,7 @@ Experiments cover stochastic **Lorenz-63**, **Lorenz-96**, and **MuJoCo Hopper**
 
 ---
 
-## Results
+## Example
 
 ### Lorenz-96: learned posterior on 15-dimensional stochastic system
 
